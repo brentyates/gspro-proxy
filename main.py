@@ -219,7 +219,7 @@ class GSProProxy:
         except Exception as e:
             logger.error(f"Error handling message from GSPro: {e}")
 
-    async def handle_launch_monitor_connection(self, websocket, path) -> None:
+    async def handle_launch_monitor_connection(self, websocket) -> None:
         """Handle a new launch monitor connection"""
         monitor = self.add_launch_monitor(websocket)
         

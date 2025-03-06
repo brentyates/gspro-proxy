@@ -37,19 +37,12 @@ PLAYERS = [
 # Sample shot data
 def generate_shot_data():
     return {
-        "ballData": {
-            "speed": random.uniform(140.0, 170.0),
-            "spinAxis": random.uniform(-15.0, 15.0),
-            "totalSpin": random.uniform(2000.0, 3000.0),
-            "horizontalAngle": random.uniform(-5.0, 5.0),
-            "verticalAngle": random.uniform(10.0, 20.0)
-        },
-        "clubData": {
-            "speed": random.uniform(95.0, 110.0),
-            "angleOfAttack": random.uniform(-3.0, 3.0),
-            "faceToTarget": random.uniform(-5.0, 5.0),
-            "path": random.uniform(-5.0, 5.0)
-        }
+        "Speed": random.uniform(140.0, 170.0),
+        "SpinAxis": random.uniform(-15.0, 15.0),
+        "TotalSpin": random.uniform(2000.0, 3000.0),
+        "HLA": random.uniform(-5.0, 5.0),
+        "VLA": random.uniform(10.0, 20.0),
+        "CarryDistance": random.uniform(220.0, 280.0)
     }
 
 async def launch_monitor_client(uri, player_data, test_duration, client_id):
@@ -58,23 +51,24 @@ async def launch_monitor_client(uri, player_data, test_duration, client_id):
         async with websockets.connect(uri) as websocket:
             logger.info(f"Client {client_id}: Connected to {uri}")
             
-            # Send player information
-            player_info = {
-                "deviceID": f"simulated_device_{client_id}",
-                "shotsCount": 0,
-                "shotTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "shotSelected": 0,
-                "api": "GSPro Connect v1",
-                "units": "Yards",
-                "Player": player_data
-            }
+            # We don't send player information anymore as per GSPro protocol
+            # Instead, we wait to receive player info from GSPro
             
-            await websocket.send(json.dumps(player_info))
-            logger.info(f"Client {client_id}: Sent player info for {player_data['name']}")
-            
-            # Wait for response
-            response = await websocket.recv()
-            logger.info(f"Client {client_id}: Received: {response}")
+            # Wait for initial player info from GSPro
+            try:
+                response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                logger.info(f"Client {client_id}: Received initial message: {response}")
+                
+                # Parse the response to check if it's player info
+                try:
+                    resp_data = json.loads(response)
+                    if resp_data.get("Code") == 201 and "Player" in resp_data:
+                        player_info = resp_data.get("Player", {})
+                        logger.info(f"Client {client_id}: Received player info - Handedness: {player_info.get('Handed')}, Club: {player_info.get('Club')}")
+                except json.JSONDecodeError:
+                    logger.warning(f"Client {client_id}: Received invalid JSON: {response}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Client {client_id}: No initial player info received within timeout")
             
             # Send shot data periodically
             end_time = asyncio.get_event_loop().time() + test_duration
@@ -86,28 +80,73 @@ async def launch_monitor_client(uri, player_data, test_duration, client_id):
                 
                 # Generate and send shot data
                 shot_count += 1
-                shot_data = generate_shot_data()
+                ball_data = generate_shot_data()
+                
+                # Format according to GSPro Connect v1 protocol
                 shot_message = {
-                    "deviceID": f"simulated_device_{client_id}",
-                    "shotNumber": shot_count,
-                    "shotTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "api": "GSPro Connect v1",
-                    "units": "Yards",
-                    "shotData": shot_data,
-                    "clubData": {
-                        "clubId": player_data["clubId"]
+                    "DeviceID": f"simulated_device_{client_id}",
+                    "Units": "Yards",
+                    "ShotNumber": shot_count,
+                    "APIversion": "1",
+                    "BallData": ball_data,
+                    "ClubData": {
+                        "Speed": random.uniform(95.0, 110.0),
+                        "AngleOfAttack": random.uniform(-3.0, 3.0),
+                        "FaceToTarget": random.uniform(-5.0, 5.0),
+                        "Path": random.uniform(-5.0, 5.0)
+                    },
+                    "ShotDataOptions": {
+                        "ContainsBallData": True,
+                        "ContainsClubData": True,
+                        "LaunchMonitorIsReady": True,
+                        "LaunchMonitorBallDetected": True,
+                        "IsHeartBeat": False
                     }
                 }
                 
                 await websocket.send(json.dumps(shot_message))
-                logger.info(f"Client {client_id}: Sent shot {shot_count} for {player_data['name']}")
+                logger.info(f"Client {client_id}: Sent shot {shot_count}")
                 
-                # Wait for response
+                # Process all responses (could be shot confirmation and player info)
                 try:
-                    response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                    logger.info(f"Client {client_id}: Received: {response}")
+                    while True:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        logger.info(f"Client {client_id}: Received: {response}")
+                        
+                        # Parse the response to check if it's player info
+                        try:
+                            resp_data = json.loads(response)
+                            if resp_data.get("Code") == 201 and "Player" in resp_data:
+                                player_info = resp_data.get("Player", {})
+                                logger.info(f"Client {client_id}: Received player info - Handedness: {player_info.get('Handed')}, Club: {player_info.get('Club')}")
+                        except json.JSONDecodeError:
+                            logger.warning(f"Client {client_id}: Received invalid JSON: {response}")
                 except asyncio.TimeoutError:
-                    logger.warning(f"Client {client_id}: No response received within timeout")
+                    # No more messages to process
+                    pass
+                
+                # Send heartbeat occasionally
+                if random.random() < 0.3:  # 30% chance to send heartbeat
+                    heartbeat = {
+                        "DeviceID": f"simulated_device_{client_id}",
+                        "APIversion": "1",
+                        "ShotDataOptions": {
+                            "ContainsBallData": False,
+                            "ContainsClubData": False,
+                            "LaunchMonitorIsReady": True,
+                            "LaunchMonitorBallDetected": False,
+                            "IsHeartBeat": True
+                        }
+                    }
+                    await websocket.send(json.dumps(heartbeat))
+                    logger.debug(f"Client {client_id}: Sent heartbeat")
+                    
+                    # Wait for heartbeat response
+                    try:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        logger.debug(f"Client {client_id}: Received heartbeat response: {response}")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Client {client_id}: No heartbeat response received within timeout")
             
             logger.info(f"Client {client_id}: Test duration completed. Sent {shot_count} shots.")
     except Exception as e:

@@ -84,6 +84,32 @@ Common configuration options:
 - `gspro-port`: The port GSPro is listening on
 - `debug`: Enable detailed logging for troubleshooting
 
+## Testing
+
+This project includes tools for testing the proxy without requiring a real GSPro installation:
+
+### Test GSPro Server
+
+The `test_gspro_server.py` script simulates a GSPro instance, allowing you to test the proxy functionality:
+
+```bash
+# Start the test GSPro server (simulating GSPro)
+python test_gspro_server.py --port 921 --debug
+
+# In another terminal, start the proxy pointing to the test server
+python main.py
+
+# In a third terminal, run the test clients
+python test_clients.py
+```
+
+This creates a complete test environment with:
+1. A simulated GSPro server
+2. The GSPro proxy
+3. Simulated launch monitor clients
+
+The test server implements the GSPro Connect API, allowing you to verify proxy functionality without a real GSPro installation.
+
 ## Troubleshooting
 
 If you encounter connection issues:
