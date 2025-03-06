@@ -1,0 +1,23 @@
+{
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 8888,
+    "max_connections": 2
+  },
+  "gspro": {
+    "host": "127.0.0.1",
+    "port": 921,
+    "reconnect_attempts": 5,
+    "reconnect_delay_seconds": 3
+  },
+  "player_detection": {
+    "enabled": true,
+    "auto_switch": true
+  },
+  "logging": {
+    "debug": false,
+    "log_messages": true,
+    "log_file": "gspro_proxy.log"
+  }
+}
+
