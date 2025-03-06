@@ -8,7 +8,7 @@ import random
 import websockets
 from websockets.server import WebSocketServerProtocol
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 
 # Configure logging
 logging.basicConfig(
@@ -24,17 +24,39 @@ logger = logging.getLogger("gspro_test_server")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8921  # Changed from 921 to non-privileged port 8921
 
+# Define player profiles
+PLAYERS = [
+    {
+        "id": 1,
+        "name": "Player One",
+        "handed": "RH",  # Right-handed
+        "club": "DR"     # Driver
+    },
+    {
+        "id": 2,
+        "name": "Player Two",
+        "handed": "LH",  # Left-handed
+        "club": "DR"     # Driver
+    }
+]
 
 class GSProTestServer:
     """Simulates a GSPro server for testing purposes"""
     
     def __init__(self):
         self.clients = set()
-        self.current_player = None
+        self.active_player_index = 0  # Start with Player 1 (index 0)
         self.shot_count = 0
         self.api_version = "1.0"
-        self.player_handedness = "RH"  # Default to right-handed
-        self.current_club = "DR"  # Default to driver
+        self.clubs = ["DR", "3W", "5W", "4I", "5I", "6I", "7I", "8I", "9I", "PW", "SW", "PT"]
+        self.last_shot_time = None
+        self.player_switch_delay = 3.0  # Seconds to wait before switching players after a shot
+        self.player_info_interval = 5.0  # Send player info every 5 seconds
+        
+    @property
+    def active_player(self):
+        """Get the currently active player"""
+        return PLAYERS[self.active_player_index]
         
     async def handle_client(self, websocket: WebSocketServerProtocol) -> None:
         """Handle a new client connection"""
@@ -45,7 +67,10 @@ class GSProTestServer:
         
         # When a client connects, immediately send player information
         # This simulates GSPro sending player info to launch monitors
-        await self.send_player_info_to_client(websocket=websocket)
+        await self.broadcast_player_info()
+        
+        # Start a task to periodically send player info to this client
+        player_info_task = asyncio.create_task(self.periodic_player_info())
         
         try:
             async for message in websocket:
@@ -94,35 +119,61 @@ class GSProTestServer:
             logger.info(f"Client {client_id} disconnected")
         finally:
             self.clients.remove(websocket)
+            player_info_task.cancel()
+            
+    async def periodic_player_info(self) -> None:
+        """Periodically send player information to all clients"""
+        try:
+            while True:
+                await asyncio.sleep(self.player_info_interval)
+                await self.broadcast_player_info()
+                logger.info(f"Sent periodic player info update")
+        except asyncio.CancelledError:
+            # Task was cancelled, exit gracefully
+            pass
+        except Exception as e:
+            logger.error(f"Error in periodic player info task: {e}")
 
-    async def send_player_info_to_client(self, websocket=None) -> None:
-        """Send player information to a specific client or all clients"""
+    async def broadcast_player_info(self) -> None:
+        """Send current player information to all connected clients"""
+        player = self.active_player
+        
+        # Format the player info message exactly as specified in the GSPro Connect v1 documentation
         player_info = {
             "Code": 201,
             "Message": "GSPro Player Information",
             "Player": {
-                "Handed": self.player_handedness,
-                "Club": self.current_club
+                "Handed": player["handed"],
+                "Club": player["club"]
             }
         }
         
         player_info_json = json.dumps(player_info)
+        logger.info(f"Broadcasting player info: Player {player['id']} ({player['handed']}, {player['club']})")
         
-        if websocket:
-            # Send to specific client
-            await websocket.send(player_info_json)
-            logger.debug(f"Sent player info to client: {player_info}")
-        else:
-            # Broadcast to all clients
-            for client in self.clients:
+        # Broadcast to all clients
+        for client in self.clients:
+            try:
                 await client.send(player_info_json)
-                logger.debug(f"Broadcast player info to all clients: {player_info}")
+                logger.debug(f"Sent player info to client {id(client)}")
+            except Exception as e:
+                logger.error(f"Failed to send player info to client {id(client)}: {e}")
 
-    async def update_player_club(self, new_club: str) -> None:
-        """Update the current club and notify clients"""
-        self.current_club = new_club
-        logger.info(f"Updated current club to: {new_club}")
-        await self.send_player_info_to_client()
+    async def switch_to_next_player(self) -> None:
+        """Switch to the next player and update all clients"""
+        # Toggle between player 1 and player 2
+        self.active_player_index = (self.active_player_index + 1) % len(PLAYERS)
+        
+        # Randomly change club occasionally
+        if random.random() < 0.3:  # 30% chance to change club
+            new_club = random.choice(self.clubs)
+            PLAYERS[self.active_player_index]["club"] = new_club
+            logger.info(f"Changed club to {new_club} for Player {self.active_player['id']}")
+        
+        logger.info(f"Switched to Player {self.active_player['id']}")
+        
+        # Broadcast the updated player info to all clients
+        await self.broadcast_player_info()
 
     async def handle_shot_data(self, data: Dict, websocket: WebSocketServerProtocol) -> Dict:
         """Process shot data and return appropriate response"""
@@ -142,9 +193,10 @@ class GSProTestServer:
             ball_data = {}
         
         self.shot_count += 1
+        self.last_shot_time = asyncio.get_event_loop().time()
         
         # Log the shot data
-        logger.info(f"Shot {self.shot_count} received from device {device_id}")
+        logger.info(f"Shot {self.shot_count} received from device {device_id} for Player {self.active_player['id']}")
         logger.debug(f"Ball data: {ball_data}")
         
         # Simulate shot processing time
@@ -156,52 +208,15 @@ class GSProTestServer:
             "Message": "Shot received successfully"
         }
         
-        # After a shot, GSPro might change the club
-        # Randomly change club occasionally
-        clubs = ["DR", "3W", "5W", "4I", "5I", "6I", "7I", "8I", "9I", "PW", "SW", "PT"]
-        if random.random() < 0.4:  # 40% chance to change club after a shot
-            self.current_club = random.choice(clubs)
-            logger.info(f"Changing club to {self.current_club} after shot")
-            
-            # Send updated player info to the client that sent the shot
-            player_info = {
-                "Code": 201,
-                "Message": "GSPro Player Information",
-                "Player": {
-                    "Handed": self.player_handedness,
-                    "Club": self.current_club
-                }
-            }
-            
-            player_info_json = json.dumps(player_info)
-            await websocket.send(player_info_json)
-            logger.debug(f"Sent player info after shot: {player_info}")
+        # Schedule player switch after a delay
+        asyncio.create_task(self.delayed_player_switch())
         
         return response
     
-    def _calculate_distance(self, ball_data: Dict) -> float:
-        """Calculate total distance based on ball data"""
-        # Simple simulation - in reality this would be based on physics
-        speed = ball_data.get("speed", 0)
-        launch_angle = ball_data.get("verticalAngle", 0)
-        
-        # Very simplified distance calculation
-        return round(speed * 1.5 * (1 + launch_angle/50), 1)
-    
-    def _calculate_carry(self, ball_data: Dict) -> float:
-        """Calculate carry distance based on ball data"""
-        # Simplified carry calculation (slightly less than total)
-        total = self._calculate_distance(ball_data)
-        return round(total * 0.9, 1)
-    
-    def _calculate_offline(self, ball_data: Dict) -> float:
-        """Calculate offline distance based on ball data"""
-        # Simple simulation of shot shape based on spin axis and angle
-        spin_axis = ball_data.get("spinAxis", 0)
-        horizontal_angle = ball_data.get("horizontalAngle", 0)
-        
-        # Positive is right, negative is left
-        return round((spin_axis / 5 + horizontal_angle) * 2, 1)
+    async def delayed_player_switch(self) -> None:
+        """Wait for a delay then switch to the next player"""
+        await asyncio.sleep(self.player_switch_delay)
+        await self.switch_to_next_player()
         
     async def start(self, host: str, port: int) -> None:
         """Start the test GSPro server"""
@@ -212,11 +227,9 @@ class GSProTestServer:
             process_request=self.process_http_request
         )
         
-        logger.info(f"GSPro Test Server started on ws://{host}:{port}/GSPro/api/connect")
+        logger.info(f"GSPro Test Server started on ws://{host}:{port}")
         logger.info(f"Ready to accept connections")
-        
-        # Start task to periodically send player updates (simulating GSPro behavior)
-        asyncio.create_task(self.periodic_player_updates())
+        logger.info(f"Active player: Player {self.active_player['id']} ({self.active_player['handed']}, {self.active_player['club']})")
         
         # Keep the server running
         await server.wait_closed()
@@ -228,58 +241,35 @@ class GSProTestServer:
                 "name": "GSPro Test Server",
                 "version": self.api_version,
                 "clients": len(self.clients),
-                "current_player": self.current_player,
-                "player_handedness": self.player_handedness,
-                "current_club": self.current_club,
+                "active_player": self.active_player,
                 "shots_processed": self.shot_count
             }).encode()
         return None  # Let websockets handle it
 
-    async def periodic_player_updates(self) -> None:
-        """Periodically send player updates to connected clients"""
-        clubs = ["DR", "3W", "5W", "4I", "5I", "6I", "7I", "8I", "9I", "PW", "SW", "PT"]
-        while True:
-            await asyncio.sleep(30)  # Send updates every 30 seconds
-            
-            if self.clients:  # Only send if we have connected clients
-                # Randomly change club occasionally to simulate GSPro behavior
-                if random.random() < 0.3:  # 30% chance to change club
-                    self.current_club = random.choice(clubs)
-                    logger.info(f"Changing club to {self.current_club}")
-                
-                await self.send_player_info_to_client()
 
-
-async def main() -> None:
+def main():
     """Main entry point for the GSPro test server"""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='GSPro Test Server')
-    parser.add_argument('--host', 
-                        default=DEFAULT_HOST,
-                        help=f'Host address to bind the server (default: {DEFAULT_HOST})')
-    parser.add_argument('--port', type=int, 
-                        default=DEFAULT_PORT,
-                        help=f'Port to bind the server (default: {DEFAULT_PORT}, note: the real GSPro uses port 921)')
-    parser.add_argument('--debug', action='store_true',
-                        help='Enable debug logging')
+    parser = argparse.ArgumentParser(description="Test GSPro server for development and testing")
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Host to bind to (default: {DEFAULT_HOST})")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port to bind to (default: {DEFAULT_PORT})")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
     
-    # Set log level based on arguments
     if args.debug:
         logger.setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
     
-    # Create and start the server
     server = GSProTestServer()
     
     try:
-        await server.start(args.host, args.port)
+        asyncio.run(server.start(args.host, args.port))
     except KeyboardInterrupt:
-        logger.info("Server shutting down...")
+        logger.info("Server stopped by user")
     except Exception as e:
-        logger.error(f"Error running server: {e}")
-
+        logger.error(f"Server error: {e}")
+        return 1
+    
+    return 0
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())

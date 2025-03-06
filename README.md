@@ -6,7 +6,7 @@ A proxy server for GSPro that enables multiple launch monitors to connect simult
 
 GSPro's Open API typically supports only one connection at a time. This proxy allows you to:
 
-- Connect two launch monitors simultaneously to one GSPro instance
+- Connect two or more launch monitors simultaneously to one GSPro instance
 - Intelligently route messages between GSPro and the appropriate launch monitor
 - Switch the active launch monitor based on player information
 - Create a multiplayer experience using hardware that would normally be limited to single-player
@@ -29,79 +29,112 @@ Launch Monitor 1 <---> |             | <--->  GSPro
 Launch Monitor 2 <---> |             | 
 ```
 
-## Setup
+## Features
 
-### Prerequisites
-- Python 3.9.4 or higher
-- pyenv (recommended for Python version management)
+- Connects to GSPro and multiple launch monitors
+- Routes messages between GSPro and launch monitors
+- Ensures only one launch monitor is active at a time based on player information
+- Configurable player-to-monitor mapping
+- Filters out shots from inactive launch monitors
 
-### Installation
+## Installation
 
-1. Clone this repository:
-   ```bash
-   git clone [repository-url]
-   cd gspro-proxy
+1. Clone the repository
+2. Install dependencies:
    ```
-
-2. Set up a Python virtual environment:
-   ```bash
-   pyenv local 3.9.4  # Optional: if using pyenv
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-   ```bash
    pip install -r requirements.txt
    ```
 
 ## Usage
 
-1. Start the GSPro application on your computer
+Start the proxy server:
 
-2. Launch the proxy server:
-   ```bash
-   python main.py
-   ```
+```
+python main.py [options]
+```
 
-3. Configure your launch monitors to connect to the proxy instead of directly to GSPro:
-   - Use the IP address of the computer running the proxy
-   - Use the same port that the proxy is configured to listen on (default: 8888)
+### Command Line Options
 
-4. Start playing! The proxy will handle routing messages between GSPro and your launch monitors.
+- `--host`: Host address to bind the proxy server (default: localhost)
+- `--port`: Port to bind the proxy server (default: 8888)
+- `--gspro-host`: GSPro host address (default: localhost)
+- `--gspro-port`: GSPro WebSocket port (default: 921)
+- `--debug`: Enable debug logging
+- `--config`: Path to configuration file (default: config.json)
 
 ## Configuration
 
-The proxy can be configured by editing the `config.json` file or using command-line arguments:
+### Main Configuration (config.json)
 
-```bash
-python main.py --port 8888 --gspro-host localhost --gspro-port 0000
+The main configuration file allows you to set default values for the proxy server:
+
+```json
+{
+    "proxy": {
+        "host": "localhost",
+        "port": 8888
+    },
+    "gspro": {
+        "host": "localhost",
+        "port": 921
+    },
+    "logging": {
+        "debug": false
+    }
+}
 ```
 
-Common configuration options:
-- `port`: The port the proxy listens on for launch monitor connections
-- `gspro-host`: The hostname or IP address of the GSPro instance
-- `gspro-port`: The port GSPro is listening on
-- `debug`: Enable detailed logging for troubleshooting
+### Player-to-Monitor Mapping (player_monitor_config.json)
+
+The player-to-monitor mapping configuration allows you to define rules for determining which launch monitor should be active based on player information:
+
+```json
+{
+    "player_monitor_rules": [
+        {
+            "player_attribute": "Handed",
+            "attribute_value": "RH",
+            "monitor_pattern": "1"
+        },
+        {
+            "player_attribute": "Handed",
+            "attribute_value": "LH",
+            "monitor_pattern": "2"
+        }
+    ]
+}
+```
+
+Each rule consists of:
+- `player_attribute`: The attribute in the player information to check (e.g., "Handed", "Club")
+- `attribute_value`: The value of the attribute to match (e.g., "RH", "LH", "DR", "PT")
+- `monitor_pattern`: A pattern to match in the launch monitor name (e.g., "1", "2", "Driver", "Putter")
+
+The proxy will check each rule in order and activate the first launch monitor that matches. If no rule matches, it will use the first available launch monitor as a fallback.
 
 ## Testing
 
-This project includes tools for testing the proxy without requiring a real GSPro installation:
+The repository includes test scripts to simulate GSPro and launch monitors:
 
-### Test GSPro Server
+- `test_gspro_server.py`: Simulates a GSPro server that sends player information and receives shots
+- `test_clients.py`: Simulates launch monitors that connect to the proxy and send shots
 
-The `test_gspro_server.py` script simulates a GSPro instance, allowing you to test the proxy functionality:
+To run the tests:
 
-```bash
-# Start the test GSPro server (simulating GSPro)
-python test_gspro_server.py --port 921 --debug
+1. Start the test GSPro server:
+   ```
+   python test_gspro_server.py --debug
+   ```
 
-# In another terminal, start the proxy pointing to the test server
-python main.py
+2. Start the proxy server:
+   ```
+   python main.py --gspro-port 8921 --debug
+   ```
 
-# In a third terminal, run the test clients
-python test_clients.py
-```
+3. Start the test clients:
+   ```
+   python test_clients.py --port 8888 --duration 30
+   ```
 
 This creates a complete test environment with:
 1. A simulated GSPro server
@@ -117,10 +150,6 @@ If you encounter connection issues:
 2. Check that your firewall allows connections on the configured ports
 3. Verify that all devices are on the same network
 4. Check the proxy logs for detailed error information
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 

@@ -61,7 +61,11 @@ class GSProClient:
         """Connect to GSPro server"""
         while True:
             try:
-                uri = f"ws://{self.host}:{self.port}/GSPro/api/connect"
+                # For the test GSPro server, we don't need the /GSPro/api/connect path
+                # Just use the host and port directly
+                uri = f"ws://{self.host}:{self.port}"
+                logger.info(f"Attempting to connect to GSPro at {uri}")
+                
                 self.websocket = await websockets.connect(uri)
                 self.connected = True
                 self.reconnect_delay = 1  # Reset delay on successful connection
@@ -100,6 +104,71 @@ class GSProProxy:
         self.launch_monitors: List[LaunchMonitor] = []
         self.gspro = GSProClient(gspro_host, gspro_port)
         self.active_monitor: Optional[LaunchMonitor] = None
+        
+        # Default player-to-monitor mapping rules
+        # This can be overridden by configuration
+        self.player_monitor_rules = [
+            {
+                "player_attribute": "Handed",
+                "attribute_value": "RH",
+                "monitor_pattern": "1"
+            },
+            {
+                "player_attribute": "Handed",
+                "attribute_value": "LH",
+                "monitor_pattern": "2"
+            }
+        ]
+        
+        # Load custom rules from config if available
+        self.load_player_monitor_rules()
+        
+    def load_player_monitor_rules(self) -> None:
+        """Load player-to-monitor mapping rules from configuration"""
+        config_path = "player_monitor_config.json"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    if "player_monitor_rules" in config and isinstance(config["player_monitor_rules"], list):
+                        self.player_monitor_rules = config["player_monitor_rules"]
+                        logger.info(f"Loaded {len(self.player_monitor_rules)} player-to-monitor mapping rules from {config_path}")
+                    else:
+                        logger.warning(f"No valid player_monitor_rules found in {config_path}, using defaults")
+            except Exception as e:
+                logger.error(f"Error loading player-to-monitor mapping rules from {config_path}: {e}")
+                logger.info("Using default player-to-monitor mapping rules")
+        else:
+            logger.info(f"No {config_path} found, using default player-to-monitor mapping rules")
+            
+    def determine_active_monitor_for_player(self, player_info: Dict) -> Optional[LaunchMonitor]:
+        """Determine which launch monitor should be active based on player information"""
+        if not player_info or not self.launch_monitors:
+            return None
+            
+        # Try to match based on configured rules
+        for rule in self.player_monitor_rules:
+            player_attribute = rule.get("player_attribute")
+            attribute_value = rule.get("attribute_value")
+            monitor_pattern = rule.get("monitor_pattern")
+            
+            if not player_attribute or not attribute_value or not monitor_pattern:
+                continue
+                
+            # Check if the player info matches this rule
+            if player_info.get(player_attribute) == attribute_value:
+                # Find a monitor that matches the pattern
+                for monitor in self.launch_monitors:
+                    if monitor_pattern in monitor.name:
+                        logger.info(f"Rule match: Player with {player_attribute}={attribute_value} mapped to monitor {monitor.name}")
+                        return monitor
+        
+        # If no rule matched or no matching monitor found, use the first monitor as fallback
+        if self.launch_monitors:
+            logger.warning(f"No matching rule for player {player_info}, using first available monitor as fallback")
+            return self.launch_monitors[0]
+            
+        return None
 
     def get_launch_monitor_by_name(self, name: str) -> Optional[LaunchMonitor]:
         """Find a launch monitor by name"""
@@ -116,16 +185,18 @@ class GSProProxy:
         return None
 
     def add_launch_monitor(self, websocket, name=None) -> LaunchMonitor:
-        """Add a new launch monitor connection"""
+        """Add a new launch monitor to the list"""
+        # Use provided name or generate one based on the connection ID
+        if not name:
+            name = f"LM_{len(self.launch_monitors) + 1}"
+        
         monitor = LaunchMonitor(websocket, name)
         self.launch_monitors.append(monitor)
         
-        # If this is the first launch monitor, make it active
+        # If this is the first monitor, make it active by default
         if len(self.launch_monitors) == 1:
-            self.active_monitor = monitor
-            monitor.active = True
-            
-        logger.info(f"Added launch monitor: {monitor.name}")
+            self.set_active_monitor(monitor)
+        
         return monitor
 
     def remove_launch_monitor(self, monitor: LaunchMonitor) -> None:
@@ -165,9 +236,48 @@ class GSProProxy:
                     # Set this monitor as active since it's sending player info
                     self.set_active_monitor(monitor)
                     logger.info(f"Updated player name for {monitor.name} to {player_name}")
+                    
+            # Check if this is a shot data message (contains BallData or similar)
+            is_shot_data = (
+                "BallData" in msg_data or 
+                "ballData" in msg_data or 
+                "shotData" in msg_data or
+                (
+                    "ShotDataOptions" in msg_data and 
+                    msg_data.get("ShotDataOptions", {}).get("ContainsBallData", False)
+                )
+            )
             
-            # Forward the message to GSPro
-            await self.gspro.send_message(message)
+            # Check if this is a heartbeat message
+            is_heartbeat = (
+                "ShotDataOptions" in msg_data and 
+                msg_data.get("ShotDataOptions", {}).get("IsHeartBeat", False)
+            )
+            
+            # Always forward heartbeat messages
+            if is_heartbeat:
+                await self.gspro.send_message(message)
+                logger.debug(f"Forwarded heartbeat from {monitor.name} to GSPro")
+            # For shot data, only forward if this monitor is active
+            elif is_shot_data:
+                if monitor.active:
+                    # This monitor is active, forward the shot data
+                    await self.gspro.send_message(message)
+                    logger.info(f"Forwarded shot data from active monitor {monitor.name} to GSPro")
+                else:
+                    # This monitor is not active, log a warning and don't forward
+                    logger.warning(f"Ignored shot data from inactive monitor {monitor.name} - not forwarding to GSPro")
+                    
+                    # Send a response back to the launch monitor indicating the shot was ignored
+                    response = {
+                        "Code": 400,
+                        "Message": "Shot ignored - this launch monitor is not active for the current player"
+                    }
+                    await monitor.send_message(json.dumps(response))
+            else:
+                # For other message types, forward to GSPro
+                await self.gspro.send_message(message)
+                logger.debug(f"Forwarded message from {monitor.name} to GSPro")
             
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON received from launch monitor {monitor.name}: {message}")
@@ -180,7 +290,43 @@ class GSProProxy:
             # Parse the message to see if it contains player-specific information
             msg_data = json.loads(message)
             
-            # Check if the message contains player information
+            # Check if the message is a player information message (Code 201)
+            code = msg_data.get("Code")
+            
+            if code == 201 and "Player" in msg_data:
+                # This is a player information message in GSPro Connect v1 format
+                player_info = msg_data.get("Player", {})
+                handedness = player_info.get("Handed", "")
+                club = player_info.get("Club", "")
+                
+                logger.info(f"Received player info from GSPro: Handedness={handedness}, Club={club}")
+                
+                # Use the new method to determine which monitor should be active
+                active_monitor = self.determine_active_monitor_for_player(player_info)
+                
+                # Deactivate all monitors first
+                for monitor in self.launch_monitors:
+                    monitor.active = False
+                    logger.info(f"Deactivated launch monitor: {monitor.name}")
+                
+                # Set the determined monitor as active
+                if active_monitor:
+                    self.set_active_monitor(active_monitor)
+                    logger.info(f"Activated launch monitor: {active_monitor.name} for {handedness} player with {club}")
+                
+                # Broadcast player info to all monitors so they know the current state
+                logger.info("Broadcasting player info to all launch monitors")
+                for monitor in self.launch_monitors:
+                    try:
+                        await monitor.send_message(message)
+                        logger.info(f"Sent player info to {monitor.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to send player info to {monitor.name}: {e}")
+                
+                return
+                
+            # Handle other message types...
+            # Check if the message contains player information in other formats
             player_name = None
             msg_type = msg_data.get("Header", {}).get("MessageType", "")
             
@@ -221,22 +367,24 @@ class GSProProxy:
 
     async def handle_launch_monitor_connection(self, websocket) -> None:
         """Handle a new launch monitor connection"""
-        monitor = self.add_launch_monitor(websocket)
+        # Extract name from query parameters if available
+        name = None
+        if hasattr(websocket, 'path') and '?' in websocket.path:
+            query_string = websocket.path.split('?', 1)[1]
+            params = {k: v for k, v in [param.split('=') for param in query_string.split('&') if '=' in param]}
+            name = params.get('name')
+            logger.info(f"Launch monitor connected with name parameter: {name}")
+        
+        # Add the launch monitor to our list
+        monitor = self.add_launch_monitor(websocket, name)
+        logger.info(f"Launch monitor connected: {monitor.name}")
         
         try:
-            # Ensure we have a connection to GSPro
-            if not self.gspro.connected:
-                await self.gspro.connect()
-                
-            # Process messages from the launch monitor
+            # Process messages from this launch monitor
             async for message in websocket:
-                logger.debug(f"Received from launch monitor {monitor.name}: {message}")
                 await self.handle_launch_monitor_message(monitor, message)
-                
-        except ConnectionClosed:
-            logger.info(f"Launch monitor {monitor.name} disconnected")
-        except Exception as e:
-            logger.error(f"Error handling launch monitor {monitor.name}: {e}")
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(f"Launch monitor disconnected: {monitor.name}")
         finally:
             self.remove_launch_monitor(monitor)
 
@@ -246,20 +394,35 @@ class GSProProxy:
             try:
                 if not self.gspro.connected:
                     await self.gspro.connect()
+                    logger.info("Successfully connected to GSPro server")
                 
                 # Wait for messages from GSPro
                 async for message in self.gspro.websocket:
                     logger.debug(f"Received from GSPro: {message}")
+                    try:
+                        # Parse the message to log its type
+                        msg_data = json.loads(message)
+                        code = msg_data.get("Code")
+                        if code:
+                            logger.info(f"Received message from GSPro with code {code}")
+                    except:
+                        pass
+                    
+                    # Process the message
                     await self.handle_gspro_message(message)
                     
-            except ConnectionClosed:
-                logger.error("GSPro connection closed")
+            except ConnectionClosed as e:
+                logger.error(f"GSPro connection closed: {e}")
+                self.gspro.connected = False
+            except websockets.exceptions.WebSocketException as e:
+                logger.error(f"WebSocket error with GSPro: {e}")
                 self.gspro.connected = False
             except Exception as e:
                 logger.error(f"Error listening to GSPro: {e}")
                 self.gspro.connected = False
             
             # If we got here, connection was lost - try to reconnect
+            logger.info("Will attempt to reconnect to GSPro server in 1 second")
             await asyncio.sleep(1)
 
     async def start_server(self, host: str, port: int) -> None:
