@@ -1,1 +1,15 @@
- 
+{
+    "player_monitor_rules": [
+        {
+            "player_attribute": "Handed",
+            "attribute_value": "RH",
+            "monitor_pattern": "1"
+        },
+        {
+            "player_attribute": "Handed",
+            "attribute_value": "LH",
+            "monitor_pattern": "2"
+        }
+    ],
+    "allow_multiple_active_monitors": true
+} 

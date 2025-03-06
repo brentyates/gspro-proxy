@@ -101,7 +101,8 @@ The player-to-monitor mapping configuration allows you to define rules for deter
             "attribute_value": "LH",
             "monitor_pattern": "2"
         }
-    ]
+    ],
+    "allow_multiple_active_monitors": false
 }
 ```
 
@@ -111,6 +112,25 @@ Each rule consists of:
 - `monitor_pattern`: A pattern to match in the launch monitor name (e.g., "1", "2", "Driver", "Putter")
 
 The proxy will check each rule in order and activate the first launch monitor that matches. If no rule matches, it will use the first available launch monitor as a fallback.
+
+#### Multiple Active Monitors
+
+By default, the proxy ensures only one launch monitor is active at a time. However, you can enable multiple active monitors by setting `allow_multiple_active_monitors` to `true` in the configuration:
+
+```json
+{
+    "player_monitor_rules": [...],
+    "allow_multiple_active_monitors": true
+}
+```
+
+When this option is enabled:
+- Multiple launch monitors can be active simultaneously
+- All active monitors can send shot data to GSPro
+- Users should coordinate to avoid sending shots at the same time
+- This is primarily intended for testing scenarios
+
+**Note:** Enabling multiple active monitors may cause unexpected behavior in GSPro if shots are sent from different monitors in rapid succession. Use this option with caution.
 
 ## Testing
 

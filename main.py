@@ -120,6 +120,9 @@ class GSProProxy:
             }
         ]
         
+        # Default configuration
+        self.allow_multiple_active_monitors = False
+        
         # Load custom rules from config if available
         self.load_player_monitor_rules()
         
@@ -135,6 +138,11 @@ class GSProProxy:
                         logger.info(f"Loaded {len(self.player_monitor_rules)} player-to-monitor mapping rules from {config_path}")
                     else:
                         logger.warning(f"No valid player_monitor_rules found in {config_path}, using defaults")
+                    
+                    # Load the multiple active monitors setting if present
+                    if "allow_multiple_active_monitors" in config:
+                        self.allow_multiple_active_monitors = bool(config["allow_multiple_active_monitors"])
+                        logger.info(f"Multiple active monitors setting: {self.allow_multiple_active_monitors}")
             except Exception as e:
                 logger.error(f"Error loading player-to-monitor mapping rules from {config_path}: {e}")
                 logger.info("Using default player-to-monitor mapping rules")
@@ -216,11 +224,18 @@ class GSProProxy:
     def set_active_monitor(self, monitor: LaunchMonitor) -> None:
         """Set the active launch monitor"""
         if monitor in self.launch_monitors:
-            if self.active_monitor:
-                self.active_monitor.active = False
-            self.active_monitor = monitor
-            monitor.active = True
-            logger.info(f"Set {monitor.name} as active monitor")
+            if not self.allow_multiple_active_monitors:
+                # Traditional behavior: only one active monitor at a time
+                if self.active_monitor:
+                    self.active_monitor.active = False
+                self.active_monitor = monitor
+                monitor.active = True
+                logger.info(f"Set {monitor.name} as the only active monitor")
+            else:
+                # Multiple active monitors allowed
+                monitor.active = True
+                self.active_monitor = monitor  # Still track the most recently activated monitor
+                logger.info(f"Set {monitor.name} as an active monitor (multiple active monitors allowed)")
 
     async def handle_launch_monitor_message(self, monitor: LaunchMonitor, message: str) -> None:
         """Handle messages from a launch monitor"""
@@ -304,10 +319,11 @@ class GSProProxy:
                 # Use the new method to determine which monitor should be active
                 active_monitor = self.determine_active_monitor_for_player(player_info)
                 
-                # Deactivate all monitors first
-                for monitor in self.launch_monitors:
-                    monitor.active = False
-                    logger.info(f"Deactivated launch monitor: {monitor.name}")
+                if not self.allow_multiple_active_monitors:
+                    # Traditional behavior: deactivate all monitors first
+                    for monitor in self.launch_monitors:
+                        monitor.active = False
+                        logger.info(f"Deactivated launch monitor: {monitor.name}")
                 
                 # Set the determined monitor as active
                 if active_monitor:
