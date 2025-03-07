@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # Make sure the script is executable
-# chmod +x run_test.sh
+# chmod +x test_multiple_monitors.sh
 
 # Set up terminal colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting GSPro Proxy Test Environment${NC}"
-echo -e "${YELLOW}This test will verify that the proxy can connect to the test GSPro server and handle launch monitor connections${NC}"
+echo -e "${GREEN}Starting Multiple Active Monitors Test${NC}"
+echo -e "${YELLOW}This test will verify that multiple launch monitors can be active simultaneously${NC}"
 echo
 
 # Step 1: Start the test GSPro server in the background
@@ -30,9 +30,9 @@ echo "Waiting 2 seconds for the proxy to initialize..."
 sleep 2
 echo
 
-# Step 3: Run the test clients
-echo -e "${GREEN}Step 3: Running the test clients...${NC}"
-python test_clients.py --host localhost --port 8888 --duration 30
+# Step 3: Run the multiple active monitors test
+echo -e "${GREEN}Step 3: Running the multiple active monitors test...${NC}"
+python test_multiple_active_monitors.py
 echo
 
 # Step 4: Clean up - kill the servers
@@ -44,8 +44,6 @@ kill $GSPRO_SERVER_PID
 echo
 
 echo -e "${GREEN}Test completed!${NC}"
-echo "Check the logs above to verify that the test clients were able to connect to the proxy"
-echo "and the proxy was able to forward messages to the test GSPro server."
-echo
-echo "If you see messages like 'Received shot from client' in the test_gspro_server.py output,"
-echo "then the test was successful and the proxy is working correctly with the test GSPro server." 
+echo "Check the logs above to verify that both launch monitors were able to send shots to GSPro."
+echo "If you see messages like 'Launch monitor LM_1: Sent shot' and 'Launch monitor LM_2: Sent shot',"
+echo "then the test was successful and multiple active monitors are working correctly." 

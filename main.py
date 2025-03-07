@@ -10,11 +10,12 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 import aiohttp
 import signal
+import traceback
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - [PROXY] - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
     ]
@@ -30,9 +31,10 @@ DEFAULT_GSPRO_PORT = 921
 
 class LaunchMonitor:
     """Represents a connected launch monitor client"""
-    def __init__(self, websocket, name=None):
-        self.websocket = websocket
-        self.name = name or str(id(websocket))
+    def __init__(self, reader, writer, name=None):
+        self.reader = reader
+        self.writer = writer
+        self.name = name or str(id(writer))
         self.player_name = None
         self.last_activity = asyncio.get_event_loop().time()
         self.active = False
@@ -40,11 +42,12 @@ class LaunchMonitor:
     async def send_message(self, message: str) -> None:
         """Send a message to the launch monitor"""
         try:
-            await self.websocket.send(message)
+            self.writer.write((message + '\n').encode())
+            await self.writer.drain()
             self.last_activity = asyncio.get_event_loop().time()
             logger.debug(f"Sent to launch monitor {self.name}: {message}")
-        except ConnectionClosed:
-            logger.error(f"Failed to send message to launch monitor {self.name}, connection closed")
+        except Exception as e:
+            logger.error(f"Failed to send message to launch monitor {self.name}: {e}")
             raise
 
 
@@ -53,7 +56,8 @@ class GSProClient:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.websocket = None
+        self.reader = None
+        self.writer = None
         self.connected = False
         self.reconnect_delay = 1  # Start with 1 second delay
 
@@ -61,17 +65,15 @@ class GSProClient:
         """Connect to GSPro server"""
         while True:
             try:
-                # For the test GSPro server, we don't need the /GSPro/api/connect path
-                # Just use the host and port directly
-                uri = f"ws://{self.host}:{self.port}"
-                logger.info(f"Attempting to connect to GSPro at {uri}")
+                logger.info(f"Attempting to connect to GSPro at {self.host}:{self.port}")
                 
-                self.websocket = await websockets.connect(uri)
+                # Use raw TCP connection instead of WebSockets
+                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
                 self.connected = True
                 self.reconnect_delay = 1  # Reset delay on successful connection
-                logger.info(f"Connected to GSPro at {uri}")
+                logger.info(f"Connected to GSPro at {self.host}:{self.port}")
                 return
-            except (ConnectionRefusedError, OSError, websockets.exceptions.WebSocketException) as e:
+            except (ConnectionRefusedError, OSError) as e:
                 self.connected = False
                 logger.error(f"Failed to connect to GSPro: {e}")
                 logger.info(f"Retrying in {self.reconnect_delay} seconds...")
@@ -80,8 +82,9 @@ class GSProClient:
 
     async def disconnect(self) -> None:
         """Disconnect from GSPro server"""
-        if self.websocket and self.connected:
-            await self.websocket.close()
+        if self.writer and self.connected:
+            self.writer.close()
+            await self.writer.wait_closed()
             self.connected = False
             logger.info("Disconnected from GSPro")
 
@@ -90,9 +93,10 @@ class GSProClient:
         try:
             if not self.connected:
                 await self.connect()
-            await self.websocket.send(message)
+            self.writer.write((message + '\n').encode())
+            await self.writer.drain()
             logger.debug(f"Sent to GSPro: {message}")
-        except (ConnectionClosed, websockets.exceptions.WebSocketException) as e:
+        except Exception as e:
             logger.error(f"Error sending message to GSPro: {e}")
             self.connected = False
             raise
@@ -192,13 +196,13 @@ class GSProProxy:
                 return monitor
         return None
 
-    def add_launch_monitor(self, websocket, name=None) -> LaunchMonitor:
+    def add_launch_monitor(self, reader, writer, name=None) -> LaunchMonitor:
         """Add a new launch monitor to the list"""
         # Use provided name or generate one based on the connection ID
         if not name:
             name = f"LM_{len(self.launch_monitors) + 1}"
         
-        monitor = LaunchMonitor(websocket, name)
+        monitor = LaunchMonitor(reader, writer, name)
         self.launch_monitors.append(monitor)
         
         # If this is the first monitor, make it active by default
@@ -251,53 +255,23 @@ class GSProProxy:
                     # Set this monitor as active since it's sending player info
                     self.set_active_monitor(monitor)
                     logger.info(f"Updated player name for {monitor.name} to {player_name}")
-                    
-            # Check if this is a shot data message (contains BallData or similar)
-            is_shot_data = (
-                "BallData" in msg_data or 
-                "ballData" in msg_data or 
-                "shotData" in msg_data or
-                (
-                    "ShotDataOptions" in msg_data and 
-                    msg_data.get("ShotDataOptions", {}).get("ContainsBallData", False)
-                )
-            )
             
-            # Check if this is a heartbeat message
-            is_heartbeat = (
-                "ShotDataOptions" in msg_data and 
-                msg_data.get("ShotDataOptions", {}).get("IsHeartBeat", False)
-            )
+            # For test mode, forward all messages to GSPro without filtering
+            await self.gspro.send_message(message)
             
-            # Always forward heartbeat messages
-            if is_heartbeat:
-                await self.gspro.send_message(message)
+            # Log based on message type
+            if "ShotDataOptions" in msg_data and msg_data.get("ShotDataOptions", {}).get("IsHeartBeat", False):
                 logger.debug(f"Forwarded heartbeat from {monitor.name} to GSPro")
-            # For shot data, only forward if this monitor is active
-            elif is_shot_data:
-                if monitor.active:
-                    # This monitor is active, forward the shot data
-                    await self.gspro.send_message(message)
-                    logger.info(f"Forwarded shot data from active monitor {monitor.name} to GSPro")
-                else:
-                    # This monitor is not active, log a warning and don't forward
-                    logger.warning(f"Ignored shot data from inactive monitor {monitor.name} - not forwarding to GSPro")
-                    
-                    # Send a response back to the launch monitor indicating the shot was ignored
-                    response = {
-                        "Code": 400,
-                        "Message": "Shot ignored - this launch monitor is not active for the current player"
-                    }
-                    await monitor.send_message(json.dumps(response))
+            elif "BallData" in msg_data or ("ShotDataOptions" in msg_data and msg_data.get("ShotDataOptions", {}).get("ContainsBallData", False)):
+                logger.info(f"Forwarded shot data from {monitor.name} to GSPro")
             else:
-                # For other message types, forward to GSPro
-                await self.gspro.send_message(message)
                 logger.debug(f"Forwarded message from {monitor.name} to GSPro")
             
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON received from launch monitor {monitor.name}: {message}")
         except Exception as e:
             logger.error(f"Error handling message from launch monitor {monitor.name}: {e}")
+            logger.debug(f"Message was: {message}")
 
     async def handle_gspro_message(self, message: str) -> None:
         """Handle messages from GSPro and route to appropriate launch monitor(s)"""
@@ -329,76 +303,38 @@ class GSProProxy:
                 if active_monitor:
                     self.set_active_monitor(active_monitor)
                     logger.info(f"Activated launch monitor: {active_monitor.name} for {handedness} player with {club}")
-                
-                # Broadcast player info to all monitors so they know the current state
-                logger.info("Broadcasting player info to all launch monitors")
-                for monitor in self.launch_monitors:
-                    try:
-                        await monitor.send_message(message)
-                        logger.info(f"Sent player info to {monitor.name}")
-                    except Exception as e:
-                        logger.error(f"Failed to send player info to {monitor.name}: {e}")
-                
-                return
-                
-            # Handle other message types...
-            # Check if the message contains player information in other formats
-            player_name = None
-            msg_type = msg_data.get("Header", {}).get("MessageType", "")
             
-            if "PlayerInfo" in msg_type:
-                player_name = msg_data.get("PlayerInfo", {}).get("Name", "")
-            elif "ShotData" in msg_type:
-                player_name = msg_data.get("ShotData", {}).get("PlayerName", "")
-            
-            # Route the message based on player name or to the active monitor
-            target_monitor = None
-            
-            if player_name:
-                # Try to find a monitor with this player name
-                target_monitor = self.get_launch_monitor_by_player(player_name)
-                logger.debug(f"Message contains player name: {player_name}")
-                
-            # If we can't find a specific monitor for the player, use the active one
-            if not target_monitor and self.active_monitor:
-                target_monitor = self.active_monitor
-                logger.debug(f"Using active monitor: {target_monitor.name}")
-            
-            # Send to the specific monitor if found
-            if target_monitor:
-                await target_monitor.send_message(message)
-            else:
-                # Broadcast to all monitors if no specific target
-                logger.debug("Broadcasting message to all launch monitors")
-                for monitor in self.launch_monitors:
+            # For test mode, broadcast all messages to all launch monitors
+            logger.debug(f"Broadcasting message to all launch monitors")
+            for monitor in self.launch_monitors:
+                try:
                     await monitor.send_message(message)
-                    
+                except Exception as e:
+                    logger.error(f"Failed to send message to {monitor.name}: {e}")
+            
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON received from GSPro: {message}")
-            # Still try to broadcast invalid messages to all monitors
-            for monitor in self.launch_monitors:
-                await monitor.send_message(message)
         except Exception as e:
             logger.error(f"Error handling message from GSPro: {e}")
 
-    async def handle_launch_monitor_connection(self, websocket) -> None:
+    async def handle_launch_monitor_connection(self, reader, writer) -> None:
         """Handle a new launch monitor connection"""
         # Extract name from query parameters if available
         name = None
-        if hasattr(websocket, 'path') and '?' in websocket.path:
-            query_string = websocket.path.split('?', 1)[1]
+        if hasattr(writer, 'path') and '?' in writer.path:
+            query_string = writer.path.split('?', 1)[1]
             params = {k: v for k, v in [param.split('=') for param in query_string.split('&') if '=' in param]}
             name = params.get('name')
             logger.info(f"Launch monitor connected with name parameter: {name}")
         
         # Add the launch monitor to our list
-        monitor = self.add_launch_monitor(websocket, name)
+        monitor = self.add_launch_monitor(reader, writer, name)
         logger.info(f"Launch monitor connected: {monitor.name}")
         
         try:
             # Process messages from this launch monitor
-            async for message in websocket:
-                await self.handle_launch_monitor_message(monitor, message)
+            async for message in writer:
+                await self.handle_launch_monitor_message(monitor, message.decode('utf-8').strip())
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Launch monitor disconnected: {monitor.name}")
         finally:
@@ -413,25 +349,41 @@ class GSProProxy:
                     logger.info("Successfully connected to GSPro server")
                 
                 # Wait for messages from GSPro
-                async for message in self.gspro.websocket:
-                    logger.debug(f"Received from GSPro: {message}")
+                while self.gspro.connected:
                     try:
-                        # Parse the message to log its type
-                        msg_data = json.loads(message)
-                        code = msg_data.get("Code")
-                        if code:
-                            logger.info(f"Received message from GSPro with code {code}")
-                    except:
-                        pass
+                        # Read a line from the TCP connection
+                        data = await self.gspro.reader.readline()
+                        if not data:  # Connection closed
+                            logger.error("GSPro connection closed (empty data)")
+                            self.gspro.connected = False
+                            break
+                            
+                        message = data.decode('utf-8').strip()
+                        logger.debug(f"Received from GSPro: {message}")
+                        
+                        try:
+                            # Parse the message to log its type
+                            msg_data = json.loads(message)
+                            code = msg_data.get("Code")
+                            if code:
+                                logger.info(f"Received message from GSPro with code {code}")
+                        except:
+                            pass
+                        
+                        # Process the message
+                        await self.handle_gspro_message(message)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error reading from GSPro: {e}")
+                        self.gspro.connected = False
+                        break
                     
-                    # Process the message
-                    await self.handle_gspro_message(message)
-                    
-            except ConnectionClosed as e:
-                logger.error(f"GSPro connection closed: {e}")
+            except ConnectionRefusedError as e:
+                logger.error(f"GSPro connection refused: {e}")
                 self.gspro.connected = False
-            except websockets.exceptions.WebSocketException as e:
-                logger.error(f"WebSocket error with GSPro: {e}")
+            except OSError as e:
+                logger.error(f"Network error with GSPro: {e}")
                 self.gspro.connected = False
             except Exception as e:
                 logger.error(f"Error listening to GSPro: {e}")
@@ -443,40 +395,64 @@ class GSProProxy:
 
     async def start_server(self, host: str, port: int) -> None:
         """Start the proxy server"""
-        server = await websockets.serve(
-            self.handle_launch_monitor_connection, 
-            host, 
-            port
+        # Create a TCP server
+        self.server = await asyncio.start_server(
+            self.handle_client_connected, host, port
         )
         
         logger.info(f"GSPro Proxy Server started on {host}:{port}")
         
-        # Start the GSPro listener as a separate task
+        # Start listening for GSPro messages
         asyncio.create_task(self.listen_to_gspro())
         
-        # Keep server running
-        await server.wait_closed()
+        # Run the server
+        async with self.server:
+            await self.server.serve_forever()
+            
+    async def handle_client_connected(self, reader, writer):
+        """Handle a new client connection"""
+        addr = writer.get_extra_info('peername')
+        logger.info(f"New client connected from {addr}")
+        
+        # Create a launch monitor for this client
+        monitor = self.add_launch_monitor(reader, writer)
+        
+        try:
+            while True:
+                data = await reader.readline()
+                if not data:  # Connection closed
+                    break
+                    
+                message = data.decode('utf-8').strip()
+                await self.handle_launch_monitor_message(monitor, message)
+        except Exception as e:
+            logger.error(f"Error handling client: {e}")
+        finally:
+            self.remove_launch_monitor(monitor)
+            writer.close()
+            await writer.wait_closed()
+            logger.info(f"Client disconnected: {monitor.name}")
 
     async def stop(self) -> None:
-        """Stop the proxy server and clean up connections"""
-        tasks = []
+        """Stop the proxy server"""
+        logger.info("Shutdown signal received, stopping server...")
         
         # Close connection to GSPro
-        if self.gspro:
-            tasks.append(self.gspro.disconnect())
-            
-        # Close connections to all launch monitors
+        await self.gspro.disconnect()
+        
+        # Close all launch monitor connections
         for monitor in self.launch_monitors:
             try:
-                await monitor.websocket.close()
+                monitor.writer.close()
+                await monitor.writer.wait_closed()
             except:
                 pass
-                
-        self.launch_monitors = []
-        self.active_monitor = None
         
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Close the server
+        if hasattr(self, 'server'):
+            self.server.close()
+            await self.server.wait_closed()
+        
         logger.info("Proxy server stopped")
 
 
@@ -519,7 +495,7 @@ async def main() -> None:
     config = load_config()
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='GSPro WebSocket Proxy Server')
+    parser = argparse.ArgumentParser(description='GSPro Proxy Server')
     parser.add_argument('--host', 
                         default=config["proxy"]["host"],
                         help=f'Host address to bind the proxy server (default: {config["proxy"]["host"]})')
@@ -531,7 +507,7 @@ async def main() -> None:
                         help=f'GSPro host address (default: {config["gspro"]["host"]})')
     parser.add_argument('--gspro-port', type=int, 
                         default=config["gspro"]["port"],
-                        help=f'GSPro WebSocket port (default: {config["gspro"]["port"]})')
+                        help=f'GSPro port (default: {config["gspro"]["port"]})')
     parser.add_argument('--debug', action='store_true',
                         default=config["logging"].get("debug", False),
                         help='Enable debug logging')
@@ -554,41 +530,38 @@ async def main() -> None:
         )
         args = parser.parse_args()
     
-    # Set log level based on arguments
+    # Set up logging based on config
     if args.debug:
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
     
-    # Create the proxy
+    # Create the proxy server
     proxy = GSProProxy(args.gspro_host, args.gspro_port)
     
-    # Setup signal handling for graceful shutdown
+    # Set up signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
     
     def signal_handler():
-        logger.info("Shutdown signal received, stopping server...")
-        stop_event.set()
+        logger.info("Received shutdown signal")
+        asyncio.create_task(shutdown())
     
+    async def shutdown():
+        await proxy.stop()
+        logger.info("Server shutdown complete")
+        loop.stop()
+    
+    # Register signal handlers
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
     
-    # Start the server task
-    server_task = asyncio.create_task(proxy.start_server(args.host, args.port))
-    
-    # Wait for stop signal
-    await stop_event.wait()
-    
-    # Clean up
-    await proxy.stop()
-    server_task.cancel()
-    
+    # Start the server
     try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
-    
-    logger.info("Server shutdown complete")
+        await proxy.start_server(args.host, args.port)
+    except KeyboardInterrupt:
+        await proxy.stop()
+    except Exception as e:
+        logger.error(f"Error starting server: {e}")
+        await proxy.stop()
 
 
 if __name__ == "__main__":
